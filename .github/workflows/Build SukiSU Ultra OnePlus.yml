@@ -144,15 +144,19 @@ jobs:
           )
           FILE="${{ github.event.inputs.FILE }}"
           if [[ "$FILE" =~ ^(.+)_([a-zA-Z])$ ]]; then
-            FILE_BASE="${BASH_REMATCH[1]}"
+            FILE_CONF="${BASH_REMATCH[1]}"
           else
-            FILE_BASE="$FILE"
+            FILE_CONF="$FILE"
           fi
+          FILE_BASE=$(echo "$FILE_CONF" | sed -E 's/_([a-zA-Z0-9])/\U\1/g; s/^oneplus/OnePlus/')
           mkdir -p ".repo/manifests_fallback"
           XML_PATH=".repo/manifests_fallback/${FILE}.xml"
           README_PATH=".repo/manifests_fallback/README.md"
-          echo "处理 FILE=$FILE, BASE=$FILE_BASE"
-          echo "🌐 拉取 OnePlus manifest 分支列表..."
+          echo "处理 FILE=$FILE, CONF=$FILE_CONF, BASE=$FILE_BASE"
+          echo "FILE_CONF=$FILE_CONF" >> $GITHUB_ENV
+          echo "FILE_BASE=$FILE_BASE" >> $GITHUB_ENV
+
+          echo "🌐 拉取 OnePlus Manifest 分支列表..."
           BRANCHES=$(curl -s https://api.github.com/repos/OnePlusOSS/kernel_manifest/branches | jq -r '.[].name')
 
           FOUND=""
@@ -178,27 +182,30 @@ jobs:
           REVISION=$(grep -oP '<project[^>]+revision="\K[^"]+' "$XML_PATH" | head -n1 || true)
           echo "解析 FILE 获取 CPU 和 ANDROID_VERSION..."
           # 提取 CPU
-          CPU=$(echo "$REVISION" | grep -oP 'sm\d+')
+          CPU=$(echo "$REVISION" | sed -E 's#^oneplus/([^_]+).*#\1#')
           # 提取 ANDROID_VERSION
           ANDROID_VERSION=$(echo "$REVISION" | grep -oP '\d{1,2}\.\d{1,2}(\.\d{1,2})?')
-
           if [[ -n "$CPU" && -n "$ANDROID_VERSION" ]]; then
             echo "✅ CPU=$CPU, ANDROID_VERSION=$ANDROID_VERSION"
             echo "CPU=$CPU" >> $GITHUB_ENV
             echo "ANDROID_VERSION=$ANDROID_VERSION" >> $GITHUB_ENV
+            # 获取短位 Android 版本号
+            echo "ANDROID_SHORT_VERSION=${ANDROID_VERSION%%.*}" >> $GITHUB_ENV
           else
             echo "❌ 无法从 revision 中提取 CPU 或 ANDROID_VERSION"
             exit 1
           fi
+
           echo "解析 KVERSION_MAP 获取 KANDROID_VERSION 和 KERNEL_VERSION..."
-          if [[ -n "${KVERSION_MAP[$FILE_BASE]}" ]]; then
-            read -r KANDROID_VERSION KERNEL_VERSION <<< "${KVERSION_MAP[$FILE_BASE]}"
-            echo "✅ KVERSION_MAP[$FILE_BASE] = $KANDROID_VERSION $KERNEL_VERSION"
+          if [[ -n "${KVERSION_MAP[$FILE_CONF]}" ]]; then
+            read -r KANDROID_VERSION KERNEL_VERSION <<< "${KVERSION_MAP[$FILE_CONF]}"
+            echo "✅ KVERSION_MAP[$FILE_CONF] = $KANDROID_VERSION $KERNEL_VERSION"
             echo "KANDROID_VERSION=$KANDROID_VERSION" >> $GITHUB_ENV
             echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
           else
-            echo "❌ KVERSION_MAP 中没有找到 $FILE_BASE 对应的版本信息"
+            echo "❌ KVERSION_MAP 中没有找到 $FILE_CONF 对应的版本信息"
           fi
+
           echo "解析 README.md 获取 CPUD 和 BUILD_METHOD..."
           if [[ -s "$README_PATH" ]]; then
             BUILD_LINE=$(grep -m1 'oplus_build_kernel.sh' "$README_PATH" || true)
@@ -214,7 +221,7 @@ jobs:
           else
             echo "❌ README.md 下载失败或为空"
           fi
-          # 传递clean后的文件信息
+          # 传递组合信息
           echo "value=${FILE_BASE}_Android${ANDROID_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Debug Show Selected Inputs
@@ -244,7 +251,6 @@ jobs:
 
       - name: Check Disk Space
         run: df -h
-
 
       - name: Create and Enable 3G Swap
         run: |
@@ -330,8 +336,11 @@ jobs:
       - name: Initialize Repo and Sync
         run: |
           mkdir kernel_workspace && cd kernel_workspace
-          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ env.CPU }} -m ${{ github.event.inputs.FILE }}.xml --depth=1
-          repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle --force-sync
+          mkdir -p .repo/manifests
+          FILE="${{ github.event.inputs.FILE }}"
+          cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
+          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/${{env.CPU}} -m "${FILE}.xml" --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags
+          repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
           if [ -e kernel_platform/common/BUILD.bazel ]; then
             sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' kernel_platform/common/BUILD.bazel
           fi
@@ -538,7 +547,7 @@ jobs:
             fi
             echo "trusty_exists=$TRUSTY_EXISTS" >> $GITHUB_OUTPUT
 
-            if [[ "$TRUSTY_EXISTS" == "false" ]]; then
+            if [[ "$TRUSTY_EXISTS" == "false" && "$file" != "oneplus_pad_2_pro" && "$file" != "oneplus_pad_3" ]]; then
               echo "修复内核版本6.6部分机型缺失Trusty OS导致的susfs的报错"
               sed -i 's/-32,12 +32,38/-32,11 +32,37/g' 50_add_susfs_in_gki-${{ env.KANDROID_VERSION }}-${KERNEL_VERSION}.patch
               sed -i '/#include <trace\/hooks\/fs.h>/d' 50_add_susfs_in_gki-${{ env.KANDROID_VERSION }}-${KERNEL_VERSION}.patch
@@ -588,6 +597,77 @@ jobs:
           echo "正在打lz4k_oplus补丁"
           patch -p1 -F 3 < lz4k_oplus.patch || true
           echo 'lz4k_oplus_patch完成'
+
+      - name: Upgrade LZ4
+        run: |
+          LZ4_VERSION="1.10.0"
+          LZ4_DOWNLOAD_URL="https://github.com/lz4/lz4/archive/refs/tags/v${LZ4_VERSION}.tar.gz"
+          cd kernel_workspace/kernel_platform/common
+          mkdir -p lz4_temp && cd lz4_temp
+          echo "下载LZ4 ${LZ4_VERSION}源码..."
+          curl -Ls "${LZ4_DOWNLOAD_URL}" -o lz4.tar.gz
+          tar -zxf lz4.tar.gz --strip-components=1
+
+          # 复制文件并使用独立命名，避免与LZ4K冲突
+          echo "复制LZ4文件到内核目录..."
+          # 源码文件（添加"lz4v2_"前缀）
+          cp lib/lz4.c ../lib/lz4v2_core.c
+          cp lib/lz4.h ../lib/lz4v2_core.h
+          cp lib/lz4hc.c ../lib/lz4v2_hc.c
+          cp lib/lz4hc.h ../lib/lz4v2_hc.h
+          # 头文件（放在独立路径）
+          mkdir -p ../include/linux/lz4v2
+          cp lib/lz4.h ../include/linux/lz4v2/lz4.h
+          cp lib/lz4hc.h ../include/linux/lz4v2/lz4hc.h
+
+          # 全局重命名函数和宏（彻底隔离命名空间）
+          echo "重命名符号以避免冲突..."
+          # 核心压缩函数重命名
+          sed -i 's/LZ4_compress_default/lz4v2_compress_default/g' ../lib/lz4v2_core.c ../lib/lz4v2_core.h
+          sed -i 's/LZ4_decompress_safe/lz4v2_decompress_safe/g' ../lib/lz4v2_core.c ../lib/lz4v2_core.h
+          # HC高压缩函数重命名
+          sed -i 's/LZ4_compress_HC/lz4v2_compress_HC/g' ../lib/lz4v2_hc.c ../lib/lz4v2_hc.h
+          # 内部宏和辅助函数重命名
+          sed -i 's/LZ4_/LZ4V2_/g' ../lib/lz4v2_core.c ../lib/lz4v2_core.h ../lib/lz4v2_hc.c ../lib/lz4v2_hc.h
+          
+          # 添加内核兼容性适配
+          echo "添加内核适配代码..."
+          # 引入内核必要头文件
+          sed -i '1i#include <linux/types.h>' ../lib/lz4v2_core.c
+          sed -i '2i#include <linux/kernel.h>' ../lib/lz4v2_core.c
+          sed -i '3i#include <linux/module.h>' ../lib/lz4v2_core.c
+          # HC文件同样处理
+          sed -i '1i#include <linux/types.h>' ../lib/lz4v2_hc.c
+          sed -i '2i#include <linux/kernel.h>' ../lib/lz4v2_hc.c
+          sed -i '3i#include <linux/module.h>' ../lib/lz4v2_hc.c
+
+          # 添加模块声明（符合内核规范）
+          echo "添加模块元数据..."
+          cat >> ../lib/lz4v2_core.c << 'EOF'
+          MODULE_LICENSE("GPL");
+          MODULE_DESCRIPTION("LZ4 1.10.0 Compression (v2)");
+          MODULE_AUTHOR("LZ4 Project");
+          EXPORT_SYMBOL(lz4v2_compress_default);
+          EXPORT_SYMBOL(lz4v2_decompress_safe);
+          EOF
+
+          cat >> ../lib/lz4v2_hc.c << 'EOF'
+          MODULE_LICENSE("GPL");
+          MODULE_DESCRIPTION("LZ4HC 1.10.0 Compression (v2)");
+          MODULE_AUTHOR("LZ4 Project");
+          EXPORT_SYMBOL(lz4v2_compress_HC);
+          EOF
+
+          # 更新Makefile确保编译（独立于LZ4K）
+          echo "更新Makefile配置..."
+          if ! grep -q "lz4v2_core.o" ../lib/Makefile; then
+            echo "obj-\$(CONFIG_LZ4V2_COMPRESS) += lz4v2_core.o" >> ../lib/Makefile
+            echo "obj-\$(CONFIG_LZ4V2_COMPRESS) += lz4v2_hc.o" >> ../lib/Makefile
+          fi
+
+          # 清理临时文件
+          cd .. && rm -rf lz4_temp
+          echo "LZ4 ${LZ4_VERSION}集成完成（与LZ4K兼容）"
 
       # 配置信息,带*为附加项目,具有一定危险性和不确定性
       - name: Add Configuration Settings
@@ -658,6 +738,14 @@ jobs:
             echo "CONFIG_ZRAM_WRITEBACK=y" >> "$CONFIG_FILE"
           fi
 
+          # LZ4 1.10.0
+          echo "CONFIG_LZ4V2_COMPRESS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_LZ4V2_HC=y" >> "$CONFIG_FILE"
+          echo "CONFIG_LZ4V2_DEBUG=n" >> "$CONFIG_FILE"
+          if [ "${{ github.event.inputs.ZRAM }}" = "true" ]; then
+            echo "CONFIG_ZRAM_LZ4V2=y" >> "$CONFIG_FILE"
+          fi
+
           # 移除构建审查
           sed -i 's/check_defconfig//' ./common/build.config.gki
 
@@ -673,10 +761,16 @@ jobs:
 
       # Custom kernel build time, without adding #1 SMP PREEMPT 自定义内核构建时间，不要加入#1 SMP PREEMPT
       - name: Custom BUILD_TIME
-        if: ${{ github.event.inputs.BUILD_TIME != '' && !contains('Ff', github.event.inputs.BUILD_TIME) }}
         shell: bash
         run: |
-          DATESTR="${{ github.event.inputs.BUILD_TIME }}"
+          INPUT_TIME="${{ github.event.inputs.BUILD_TIME }}"
+          if [[ -n "$INPUT_TIME" && "$INPUT_TIME" != *[Ff]* ]]; then
+            DATESTR="$INPUT_TIME"
+            echo "Using input BUILD_TIME: $DATESTR"
+          else
+            DATESTR="$(TZ='UTC' date +'%a %b %d %T %Z %Y')"
+            echo "Using UTC time as fallback: $DATESTR"
+          fi
           echo "KBUILD_BUILD_TIMESTAMP=${DATESTR}" >> "$GITHUB_ENV"
           echo "KBUILD_BUILD_VERSION=1" >> "$GITHUB_ENV"
           cd kernel_workspace/kernel_platform/
@@ -731,6 +825,9 @@ jobs:
           export CC="ccache clang"
           sudo apt install -y libelf-dev ccache
           cd kernel_workspace/kernel_platform/common
+          # 强制修改 SUBLEVEL，默认关闭
+          # sed -i 's/^SUBLEVEL[[:space:]]*=[[:space:]]*.*/SUBLEVEL = 99/' Makefile
+
           MAKE_ARGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             RUSTC=../../prebuilts/rust/linux-x86/1.73.0b/bin/rustc \
             PAHOLE=../../prebuilts/kernel-build-tools/linux-x86/bin/pahole \
@@ -746,6 +843,9 @@ jobs:
         if: ${{ github.event.inputs.FAST_BUILD == 'false' || steps.fast_build.outputs.fallback == 'true' }}
         run: |
           cd kernel_workspace
+          # 强制修改 SUBLEVEL，默认关闭
+          # sed -i 's/^SUBLEVEL[[:space:]]*=[[:space:]]*.*/SUBLEVEL = 99/' kernel_platform/common/Makefile
+
           if [ -f ./kernel_platform/build_with_bazel.py ]; then
             ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
             ./kernel_platform/build_with_bazel.py --lto=thin -t ${{ env.CPUD }} ${{ env.BUILD_METHOD }}
@@ -781,9 +881,9 @@ jobs:
             cp "$image_path" kernel_workspace/kernel_platform/out/Final-Image-Find/Image
           fi
           if [ -n "$dir2" ] && [ "${{ env.CPU }}" = "sm8750" ] && [ "${{ github.event.inputs.FAST_BUILD }}" = "false" ]; then
-            echo "当前正在使用官方脚本构建 sm8750，需额外复制一些其它镜像文件：dtbo.img、system_dlkm.img、vendor_dlkm.img、vendor_boot.img。请注意，如果你在刷完官方脚本构建后想换成极速构建，请还原这些分区！"
-            echo "You are currently building sm8750 with the official script. Additional image files will be copied: dtbo.img, system_dlkm.img, vendor_dlkm.img, vendor_boot.img. Please note: If you switch to fast build after flashing this build, make sure to restore these partitions!"
-            for file in dtbo.img system_dlkm.erofs.img vendor_dlkm.img vendor_boot.img; do
+            echo "当前正在使用官方脚本构建 sm8750，需额外复制一些其它镜像文件：dtbo.img、system_dlkm.img。请注意，如果你在刷完官方脚本构建后想换成极速构建，请还原这些分区！"
+            echo "You are currently building sm8750 with the official script. Additional image files will be copied: dtbo.img, system_dlkm.img. Please note: If you switch to fast build after flashing this build, make sure to restore these partitions!"
+            for file in dtbo.img system_dlkm.erofs.img; do
               if [ -f "$dir2$file" ]; then
                 target_name="$file"
                 if [ "$file" = "system_dlkm.erofs.img" ]; then
